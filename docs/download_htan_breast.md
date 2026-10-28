@@ -39,5 +39,5 @@ Some sections ship two TIFFs. Use the one listed for that section in `docs/htan_
 ```bash
 python encoder/prepare_visium.py --samples htan_breast/htan_breast_samples.tsv --out prepared/htan_breast --stage all
 sbatch encoder/train_slurm.sh encoder/configs/pooled_discotme.yaml runs/htan_breast_encoder inputs/htan_breast   # edit paths in the config first
-python scripts/run_vivatme.py prepare --config configs/htan_breast.yaml   # then train / null / summarize / deviations
+python scripts/run_vivatme.py run --config configs/htan_breast.yaml
 ```

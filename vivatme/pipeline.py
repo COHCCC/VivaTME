@@ -86,6 +86,14 @@ def deviations(cohort_dir, seed, tau):
         final, pilot, stats = deviation_readout(x, s, b, ref, tau, tau, k)
     final.update(labels=b['labels'], tau=np.array(tau))
     save_npz(out / f'seed{seed}/deviations.npz', **final)
+    # One row per (section, compartment): soft mass, standardized deviation z, deviation magnitude, reported (z > tau).
+    mapping = {int(a): b_ for a, b_ in read_json(out / f'seed{seed}/readout_stats.json')['label_to_reference'].items()}
+    names = meta.drop_duplicates('sample_index').sort_values('sample_index').sample_id.tolist()
+    norm = np.linalg.norm(final['delta'], axis=2)
+    rows = [dict(sample_id=names[j], compartment=f'C{mapping[kk]}', soft_mass=float(final['section_mass'][j, kk]),
+                 z=float(final['z'][kk, j]), deviation_norm=float(norm[kk, j]), eligible=bool(final['eligible'][kk, j]),
+                 reported=bool(norm[kk, j] > 0)) for kk in range(k) for j in range(len(names))]
+    pd.DataFrame(rows).sort_values('z', ascending=False).to_csv(out / f'seed{seed}/deviations.csv', index=False)
     return final
 
 

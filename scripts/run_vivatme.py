@@ -1,7 +1,12 @@
 """VivaTME command-line driver.
 
+  python scripts/run_vivatme.py run       --config configs/her2.yaml
+      one command: reference fit -> adapter training -> compartments -> deviations. The deviation threshold is the
+      full-refit tau95 if null/thresholds.json exists, otherwise the fast fixed-assignment tau95 of the reference fit.
+
+Individual stages:
   python scripts/run_vivatme.py prepare   --config configs/her2.yaml
-  python scripts/run_vivatme.py train     --config configs/her2.yaml --seed 42      (also 43, 44)
+  python scripts/run_vivatme.py train     --config configs/her2.yaml [--seed 42]
   python scripts/run_vivatme.py null      --config configs/her2.yaml --index 0      (0..499; one SLURM array task each)
   python scripts/run_vivatme.py summarize --config configs/her2.yaml
   python scripts/run_vivatme.py deviations --config configs/her2.yaml --seed 42     (uses null/thresholds.json tau95)
@@ -21,7 +26,7 @@ from vivatme.utils import read_json  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('stage', choices=['prepare', 'train', 'null', 'summarize', 'deviations'])
+    ap.add_argument('stage', choices=['run', 'prepare', 'train', 'null', 'summarize', 'deviations'])
     ap.add_argument('--config', required=True)
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--index', type=int, default=None, help='null permutation (default: SLURM_ARRAY_TASK_ID)')
@@ -33,9 +38,16 @@ def main():
     out = Path(os.path.expandvars(c.get('out', 'results'))) / c['cohort']
     sched = dict(epochs=15, adv_warm=3) if a.smoke else dict(epochs=100, adv_warm=10)
     n_perm = 2 if a.smoke else 500
-    if a.stage == 'prepare':
+    if a.stage in ('run', 'prepare'):
         pipeline.prepare(out, root / c['U'], root / c['spots'], int(c['K']), n_perm=n_perm)
-    elif a.stage == 'train':
+    if a.stage == 'run':
+        pipeline.train_seed(out, a.seed, **sched)
+        null = out / 'null/thresholds.json'
+        tau = a.tau if a.tau is not None else read_json(null)['tau']['95'] if null.exists() else read_json(out / 'reference/stats.json')['reference_tau']['95']
+        f = pipeline.deviations(out, a.seed, tau)
+        print(f'compartments: {out}/seed{a.seed}/labels.csv\ndeviations (tau {tau:.3f}): {out}/seed{a.seed}/deviations.csv', flush=True)
+        return
+    if a.stage == 'train':
         pipeline.train_seed(out, a.seed, **sched)
     elif a.stage == 'null':
         b = a.index if a.index is not None else int(os.environ['SLURM_ARRAY_TASK_ID'])
@@ -43,7 +55,7 @@ def main():
     elif a.stage == 'summarize':
         n = 1 if a.smoke else 500
         print(pipeline.summarize_null(out, n=n, min_ok=1 if a.smoke else 450), flush=True)
-    else:
+    elif a.stage == 'deviations':
         tau = a.tau if a.tau is not None else read_json(out / 'null/thresholds.json')['tau']['95']
         f = pipeline.deviations(out, a.seed, tau)
         print('tau', tau, 'reported cells', int((f['delta'] ** 2).sum(-1).astype(bool).sum()), flush=True)

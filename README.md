@@ -1,132 +1,158 @@
 # VivaTME
 
-**VivaTME** (multi-**V**iew **I**ntegration and **V**ariation **A**nalysis of **T**umor **M**icro**E**nvironments) aligns tumor-microenvironment compartments across tissue sections and quantifies, for every compartment in every section, a calibrated deviation from its shared state.
+**VivaTME** (multi-**V**iew **I**ntegration and **V**ariation **A**nalysis of **T**umor **M**icro**E**nvironments) takes a cohort of Visium sections from different patients and returns:
 
-Given a cohort of spatial transcriptomics sections with matched H&E images, VivaTME:
+- **shared tissue compartments** across all sections and patients (one label per spot);
+- for every compartment in every section, a **deviation** from the compartment's shared state, with a calibrated reporting threshold.
 
-0. encodes every spot with a multimodal, multiscale model trained jointly on all sections (pooled [DiSCoTME](https://github.com/COHCCC/DiSCoTME), `encoder/`);
-1. fits **shared compartments with whole-section offsets** on these frozen spot representations;
-2. aligns the representations **within compartments** with a residual adapter trained against compartment-conditional section discriminators (gradient reversal). Only confidently assigned spots with a cross-section mutual nearest neighbour take part in this alignment;
-3. reads out compartment labels from the aligned representation, then decomposes each compartment mean of each section on the **pre-alignment** representation into a shared center, a section-wide shift and a sparse deviation;
-4. sets the reporting threshold τ by a **full-refit permutation null**: the whole pipeline is rerun on 500 block-permuted cohorts, which bounds the family-wise error rate at 0.05.
-
-This repository contains the code that produces the VivaTME compartments and deviations reported in the paper, starting from Visium Space Ranger output and H&E images.
-
-## Installation
+## Quick start
 
 ```bash
-conda create -n vivatme python=3.9.18
-conda activate vivatme
-pip install -r requirements.txt
+git clone https://github.com/COHCCC/VivaTME.git && cd VivaTME
+pip install -r requirements-encoder.txt
 ```
 
-VivaTME itself runs on CPU (Linux) with the versions pinned in `requirements.txt`; only the encoder (`requirements-encoder.txt`) needs a CUDA GPU.
+**1. List your sections** in a tab-separated sheet. Each section needs its Space Ranger output folder and the full-resolution H&E image:
 
-## From Visium sections to U (`encoder/`)
+```
+sample_id	spaceranger_dir	image
+P1_A	data/P1_A/outs	data/P1_A/HE.tif
+P2_A	data/P2_A/outs	data/P2_A/HE.tif
+...
+```
 
-VivaTME works on frozen multimodal spot representations `U` from a DiSCoTME model trained jointly on all sections of a cohort ("pooled DiSCoTME"). The model architecture is DiSCoTME's (`encoder/dilated_blocks.py` is copied unchanged from that repository). `encoder/` holds the three steps from raw Visium data to `U`:
+**2. Encode the spots** (multimodal, multiscale DiSCoTME trained jointly on all sections):
 
 ```bash
-pip install -r requirements-encoder.txt          # needs a CUDA GPU (LongNet attention via torchscale/xformers)
-
-# 1. Preprocessing (CPU). Sample sheet: sample_id, spaceranger_dir, image (full-resolution H&E TIFF)
-python encoder/prepare_visium.py --samples samples.tsv --out prepared/mycohort --stage all
-
-# 2. Joint training on all sections + 3. export of U  (the paper used 4 nodes x 4 V100, 10 epochs)
-sbatch encoder/train_slurm.sh encoder/configs/pooled_discotme.yaml runs/mycohort_encoder inputs/mycohort
+python encoder/prepare_visium.py --samples samples.tsv --out prepared/mycohort
+sbatch encoder/train_slurm.sh encoder/configs/pooled_discotme.yaml runs/mycohort inputs/mycohort
 ```
 
-- **Preprocessing.** Spot coordinates are converted to micrometres by fitting the Visium lattice (100 µm centre pitch). Each in-tissue spot gets a 55 × 55 µm H&E crop, resized to 224 × 224 px in its original colours. Genes are the Ensembl IDs assayed in every section, with mitochondrial genes and genes without counts in the cohort removed. Counts are normalised to 10,000 per spot and log-transformed when they are loaded.
-- **Training.** An image branch (DINO ViT-S/16, trainable) and a gene branch (residual MLP) are each followed by a dilated-attention (LongNet) context encoder over the 15 nearest spots within 200 µm, plus an adaptive local/neighbourhood gate. The two branches are trained with a symmetric multi-positive InfoNCE loss with count-matched mixed negatives: 10 epochs, seed 42, global batch 256, AdamW, cosine schedule, AMP. Section-balanced sampling gives every section equal weight.
-- **Export.** `U = [F_img/‖F_img‖, F_gene/‖F_gene‖]`, where F is the 256-d output of each context encoder before the projection heads.
+Before submitting, set `prepared_root`, `gene_list` and the DINO weight path in the config. The job writes `inputs/mycohort/U.npy` and `spots.csv`.
 
-`docs/download_htan_breast.md` describes how to download the HTAN breast sections used in the paper.
+**3. Run VivaTME:**
 
-## Input of VivaTME
+```bash
+cp configs/htan_breast.yaml configs/mycohort.yaml    # set cohort: mycohort and K (number of compartments)
+export VIVATME_DATA=inputs VIVATME_OUT=results
+python scripts/run_vivatme.py run --config configs/mycohort.yaml
+```
 
-VivaTME runs on two files per cohort; `encoder/extract.py` writes both:
+Results are in `results/mycohort/seed42/`:
 
 | file | content |
 | --- | --- |
-| `U.npy` | `n_spots × 512` float array: `[f_img/‖f_img‖, f_gene/‖f_gene‖]`, the L2-normalised image and gene branch outputs (256 each) of a DiSCoTME model trained jointly on all sections of the cohort and then frozen |
-| `spots.csv` | one row per spot, in the row order of `U.npy`, with the columns `global_index` (0…n−1), `spot_id` (unique), `sample_id`, `sample_index` (0…S−1, rows sorted by it) and `x_um`, `y_um` (spot centre in µm). Only these columns are read, so annotations never enter the model. |
+| `labels.csv` | `spot_id, sample_id, compartment` (`C0` … `C{K-1}`, or `dustbin` for spots that fit no compartment) |
+| `deviations.csv` | one row per section × compartment: `soft_mass`, standardized deviation `z`, `deviation_norm`, `reported`, sorted by `z` |
 
-Cohorts used in the paper:
+## Calibrated threshold
 
-| config | cohort | sections | K | raw data |
-| --- | --- | --- | --- | --- |
-| `configs/her2.yaml` | HER2-positive breast cancer (Andersson et al. 2021) | 36 | 6 | Zenodo [10.5281/zenodo.4751624](https://doi.org/10.5281/zenodo.4751624) |
-| `configs/crc.yaml` | Colorectal cancer (Valdeolivas et al. 2024) | 14 | 8 | Zenodo [7760264](https://zenodo.org/records/7760264) |
-| `configs/tnbc.yaml` | Triple-negative breast cancer (Wang et al. 2024) | 94 | 9 | Zenodo [14204217](https://zenodo.org/records/14204217) |
-| `configs/htan_breast.yaml` | HTAN breast, Visium | 22 | 6 | HTAN data portal |
-| `configs/htan_crc.yaml` | HTAN colorectal, Visium | 12 | 6 | HTAN data portal |
-
-`encoder/prepare_visium.py` handles standard Visium (both HTAN cohorts). HER2 and TNBC are legacy Spatial Transcriptomics arrays, and the CRC sections came with NDPI scans. For these three cohorts, patches and coordinates were prepared with the same rules (crop of one spot field of view, resized to 224 px; micrometre coordinates from the array pitch) by dataset-specific readers that are not part of this repository.
-
-Point the configs at your data with two environment variables:
+`run` reports deviations with a fast threshold from the initial fit. The threshold used in the paper comes from a **full-refit permutation null**: the whole pipeline is rerun on 500 permuted cohorts, which bounds the family-wise error rate over all section × compartment cells at 0.05. The permutations are independent, so run them as an array job:
 
 ```bash
-export VIVATME_DATA=/path/to/inputs      # contains <cohort>/U.npy and <cohort>/spots.csv
-export VIVATME_OUT=/path/to/results
+sbatch --array=0-499 --wrap "python scripts/run_vivatme.py null --config configs/mycohort.yaml"
+python scripts/run_vivatme.py summarize --config configs/mycohort.yaml      # writes null/thresholds.json
+python scripts/run_vivatme.py run --config configs/mycohort.yaml            # deviations at the calibrated tau
 ```
 
-## Running
+`scripts/slurm_example.sh` chains all stages on a SLURM cluster.
 
-All stages run on CPU. The first three commands below reproduce one cohort.
+## How it works
 
-```bash
-C=configs/her2.yaml
+**Encoder.** Each spot's 224 × 224 px H&E patch and its gene expression go through an image branch (DINO ViT-S/16) and a gene branch. Each branch has a dilated-attention context encoder over the 15 nearest spots within 200 µm and an adaptive gate between local and neighbourhood information. The two branches are trained contrastively on all sections of the cohort. The spot representation is
 
-# 1. Reference fit on U: shared compartments (10 k-means++ restarts), spatial blocks, neighbour graphs
-python scripts/run_vivatme.py prepare --config $C
-
-# 2. Adapter training and compartment read-out; seeds 43 and 44 share the seed-42 reference
-for s in 42 43 44; do python scripts/run_vivatme.py train --config $C --seed $s; done
-
-# 3. Full-refit null: 500 independent permutations (one SLURM array task each), then tau
-python scripts/run_vivatme.py null --config $C --index 0      # ... --index 499
-python scripts/run_vivatme.py summarize --config $C
-
-# 4. Deviations of every seed at the calibrated tau95
-for s in 42 43 44; do python scripts/run_vivatme.py deviations --config $C --seed $s; done
+```math
+\mathbf{u}_i = \left[\, \mathbf{f}^{\mathrm{img}}_i / \lVert \mathbf{f}^{\mathrm{img}}_i \rVert ,\; \mathbf{f}^{\mathrm{gene}}_i / \lVert \mathbf{f}^{\mathrm{gene}}_i \rVert \,\right] \in \mathbb{R}^{512}.
 ```
 
-`scripts/slurm_example.sh` chains these stages on a SLURM cluster. `--smoke` runs a short schedule (15 epochs, 2 permutations) to test the code path.
+**Shared compartments.** $K$ centres $\boldsymbol\mu_k$, a whole-section offset $\mathbf{o}_s$ and a dustbin are fitted with soft assignments
 
-Approximate cost per cohort: `prepare` takes minutes, and each `train` seed takes 0.5–3 h on 8 CPU cores. Each null permutation reruns the whole pipeline and takes about 6–60 min on 8 cores with < 11 GB of memory; the median was 6 min (HER2) and 59 min (TNBC).
+```math
+q_{ik} \propto \exp\!\left(-\lVert \mathbf{u}_i - \mathbf{o}_{s(i)} - \boldsymbol\mu_k \rVert^2 / T\right).
+```
 
-### Outputs (`$VIVATME_OUT/<cohort>/`)
+**Alignment within compartments.** A residual adapter $\mathbf{z}_i = \mathbf{u}_i + g(\mathbf{u}_i)$ preserves local geometry. One discriminator per compartment tries to predict the section of $\mathbf{z}_i - \boldsymbol\eta_{s(i)}$, and the adapter is trained against it through gradient reversal. Only confidently assigned spots with a mutual nearest neighbour in another section take part, so a compartment can be shared by a subset of sections. Compartment labels are read out from the aligned representation.
+
+**Deviations.** With these labels held fixed, each compartment mean on the pre-alignment representation is decomposed as
+
+```math
+\bar{\mathbf{u}}_{sk} \approx \boldsymbol\mu_k + \mathbf{o}_s + \boldsymbol\delta_{sk},
+\qquad
+\boldsymbol\delta_{sk} = \mathbf{r}_{sk}\left(1 - \frac{\tau}{z_{sk}}\right)_{+},
+\qquad
+z_{sk} = \sqrt{m_{sk}}\,\lVert \mathbf{r}_{sk} \rVert ,
+```
+
+where $\mathbf{r}_{sk}$ is the residual after the shared centre and the section offset and $m_{sk}$ is the soft mass of the cell. A deviation is reported when $z_{sk} > \tau$.
+
+## Details
+
+### Inputs
+
+| file | content |
+| --- | --- |
+| sample sheet | `sample_id` ([A-Za-z0-9_.-]+), `spaceranger_dir` (holds `filtered_feature_bc_matrix/` and `spatial/tissue_positions[_list].csv`), `image` (full-resolution uint8 RGB TIFF). Relative paths are resolved from the sheet's folder. |
+| `U.npy` | `n_spots × 512` spot representations (written by `encoder/extract.py`) |
+| `spots.csv` | `global_index`, `spot_id`, `sample_id`, `sample_index`, `x_um`, `y_um`, in the row order of `U.npy`. Any `U.npy` + `spots.csv` pair in this format can be used directly in step 3. |
+| `configs/*.yaml` | `cohort`, `K`, `U`, `spots` (relative to `$VIVATME_DATA`), `out` |
+
+### Outputs (`results/<cohort>/`)
 
 | path | content |
 | --- | --- |
-| `reference/fit.npz` | reference fit on U: `labels` (−1 = dustbin), `centers_full`, `offsets`, `q` |
-| `reference/graphs.npz` | within-section 15-NN, cross-section MNN participation flag, spatial block of every spot |
-| `seed{S}/labels.csv` | compartment of every spot (`label`: native id, −1 = dustbin; `compartment`: reference compartment `C0…`) |
-| `seed{S}/compartments.npz` | read-out fit on the aligned representation |
-| `seed{S}/train/` | EMA adapter weights (`model_ema.pt`), aligned features, training log |
-| `null/perm_XXX.json`, `null/thresholds.json` | maximum z of each permutation; τ90/τ95/τ99 |
-| `seed{S}/deviations.npz` | `delta` (K × S × 512), `z` (K × S), `eligible` (soft mass ≥ 30), `residual` r_sk, `section_mass`, `centers_full`, `offsets`, `tau`. A cell (k, s) is reported when it is eligible and z > τ (equivalently ‖δ‖ > 0). |
+| `seed42/labels.csv`, `seed42/deviations.csv` | main results (see Quick start) |
+| `seed42/deviations.npz` | arrays: `delta` (K × S × 512), `z`, `eligible` (soft mass ≥ 30), `residual`, `section_mass`, `centers_full`, `offsets`, `tau` |
+| `seed42/compartments.npz`, `seed42/train/` | compartment fit on the aligned representation; adapter weights and aligned features |
+| `reference/` | initial compartment fit, spatial blocks and neighbour graphs |
+| `null/` | maximum z of every permutation and `thresholds.json` (τ90 / τ95 / τ99) |
 
-Full-refit thresholds obtained in the paper (τ95, 500 permutations): HER2 2.356, CRC 5.025, TNBC 3.463, HTAN breast 8.333, HTAN CRC 8.285.
+### Preprocessing (`encoder/prepare_visium.py`)
 
-## Settings
+| step | rule |
+| --- | --- |
+| coordinates | affine fit of the Visium hexagonal lattice (100 µm centre pitch) to the spot pixels, giving µm per pixel |
+| patches | 55 × 55 µm crop around every in-tissue spot, bilinear resampling to 224 × 224 px, original colours; spots whose crop leaves the image are excluded |
+| genes | Ensembl IDs assayed in every section, without mitochondrial genes and without genes that have zero counts in the whole cohort |
+| expression | counts per spot scaled to 10,000, then `log1p` |
 
-All hyper-parameters are fixed in the code and listed in the Methods:
+### Encoder (`encoder/configs/pooled_discotme.yaml`)
 
-- **Compartments:** soft assignment with dustbin cost c0 (95th percentile of the initial nearest-centre distance) and temperature T (0.1 × its median); section-balanced centres; offsets from compartments present (soft mass ≥ 30) in ≥ 3 sections, λ_o = 10; tolerance 1e-4.
-- **Adapter:** 512–256–512 SELU, zero-initialised output; L_keep with 15 near and 15 far within-section spots; 0.1‖g‖²; 0.1 L_proto. One discriminator per compartment (512–128–S, dropout 0.2, label smoothing 0.1), active with ≥ 3 sections × ≥ 20 confident (q ≥ 0.6) MNN spots; 32 spots per (compartment, section) and step. Batch 1,024, 100 epochs, AdamW (1e-3 / 3e-3, weight decay 0.01), adversary from epoch 10 with λ(t) rising to 10; EMA 0.999.
-- **Deviations:** group soft-threshold with √m_sk scaling, eligible cells m_sk ≥ 30. The fixed-assignment fit runs twice, first from the reference and then from its own result.
-- **Calibration:** blocks of ~25 spots (≤ 550 µm) within each (section, compartment); 500 permutations; τ = 95th percentile of the maximum z.
+| setting | value |
+| --- | --- |
+| image branch | DINO ViT-S/16 (trainable) → 256-d |
+| gene branch | residual MLP → 512-d |
+| context encoder | LongNet dilated attention, 4 layers, 8 heads, 15 neighbours within 200 µm; adaptive local/neighbourhood gate |
+| loss | symmetric multi-positive InfoNCE, temperature 0.07, count-matched mixed negatives |
+| training | 10 epochs, global batch 256, section-balanced sampling, AdamW with cosine schedule, mixed precision |
 
-## Reproducibility
+### VivaTME (`vivatme/`)
 
-The package is a consolidation of the research code used for the paper. On the same inputs it reproduces the original reference fit, spatial blocks and neighbour graphs exactly, and floating-point values to within 1e-14. Training with PyTorch on CPU is deterministic for a given machine and thread count, but can differ slightly across hardware and library builds. Compartment labels and deviations are therefore reproduced up to this numerical noise; cross-seed agreement is reported in the paper.
+| component | setting |
+| --- | --- |
+| compartments | dustbin cost: 95th percentile of the initial nearest-centre distance; $T$ = 0.1 × its median; offsets from compartments present (soft mass ≥ 30) in ≥ 3 sections, ridge λ = 10 |
+| adapter | 512–256–512 SELU, zero-initialised output; geometry loss on 15 near and 15 far within-section spots; 0.1 ‖g‖²; 0.1 prototype loss |
+| discriminators | one per compartment, 512–128–S, dropout 0.2, label smoothing 0.1; active with ≥ 3 sections × ≥ 20 confident (q ≥ 0.6) spots that have a mutual nearest neighbour; 32 spots per section and step |
+| training | batch 1,024, 100 epochs, AdamW (1e-3 adapter, 3e-3 discriminators), adversary from epoch 10 with weight rising to λ = 10, EMA 0.999 |
+| deviations | cells with soft mass ≥ 30; fixed-assignment group soft-threshold |
+| calibration | blocks of ~25 spots (≤ 550 µm) within each section × compartment; 500 permutations; τ = 95th percentile of the maximum z |
+
+### Cohorts of the paper
+
+| config | cohort | sections | K | full-refit τ95 |
+| --- | --- | --- | --- | --- |
+| `her2.yaml` | HER2-positive breast cancer (Andersson et al. 2021, [Zenodo 4751624](https://doi.org/10.5281/zenodo.4751624)) | 36 | 6 | 2.356 |
+| `crc.yaml` | colorectal cancer (Valdeolivas et al. 2024, [Zenodo 7760264](https://zenodo.org/records/7760264)) | 14 | 8 | 5.025 |
+| `tnbc.yaml` | triple-negative breast cancer (Wang et al. 2024, [Zenodo 14204217](https://zenodo.org/records/14204217)) | 94 | 9 | 3.463 |
+| `htan_breast.yaml` | HTAN breast, Visium ([download](docs/download_htan_breast.md)) | 22 | 6 | 8.333 |
+| `htan_crc.yaml` | HTAN colorectal, Visium | 12 | 6 | 8.285 |
+
+HER2 and TNBC are legacy Spatial Transcriptomics arrays and the CRC sections came with NDPI scans. Their patches and coordinates were prepared with the same rules by dataset-specific readers.
 
 ## Citation
 
-> VivaTME: Multimodal Alignment for Quantifying Patient Differences within Shared Tumor Microenvironment Compartments. (manuscript in preparation, 2026)
+> VivaTME: Multimodal Alignment for Quantifying Patient Differences within Shared Tumor Microenvironment Compartments. Manuscript in preparation (2026).
 
-Spot representations: Song J. *et al.* Using multi-scale spatial integration of histology and transcriptomics to discover hidden tumor microenvironment motifs. https://github.com/COHCCC/DiSCoTME
+The encoder architecture is from DiSCoTME: https://github.com/COHCCC/DiSCoTME
 
 ## License
 
