@@ -1,0 +1,36 @@
+# Pooled DiSCoTME settings used for every cohort of the paper (HTAN breast shown).
+# Replace the three paths; everything else was fixed across cohorts.
+experiment: htan_breast_pooled_discotme
+data:
+  prepared_root: /path/to/prepared            # OUT of encoder/prepare_visium.py
+  gene_list: /path/to/prepared/genes/lists/full_common_nonmitochondrial_nonzero.tsv
+  sample_ids: null                            # null = all sections in the sample sheet, in its order
+  max_neighbors: 15                           # neighbouring spots within radius_um, nearest first
+  radius_um: 200.0
+  target_sum: 10000.0                         # counts per spot before log1p
+model:
+  checkpoint_path: /path/to/vit_small_patch16_224.dino/model.safetensors   # timm DINO ViT-S/16 weights (initialisation)
+  embed_dim: 256
+  proj_dim: 128
+  num_context_layers: 4
+  num_heads: 8
+  dropout: 0.1
+  position_scale_um: 200.0
+  gradient_checkpointing: false
+  attention_backend: torchscale
+training:
+  epochs: 10
+  batch_size: 16                              # per GPU; the paper used 16 GPUs (global batch 256)
+  num_workers: 2
+  seed: 42
+  temperature: 0.07
+  weight_decay: 1.0e-05
+  amp: true
+  initial_loss_scale: 512.0
+  grad_clip: 1.0
+  lr_backbone: 1.0e-05
+  lr_image: 0.0001
+  lr_gene_encoder: 0.0003
+  lr_gene_projection: 0.0001
+  log_every: 10
+  negative_mode: count_matched_mixed

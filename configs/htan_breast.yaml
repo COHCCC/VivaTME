@@ -1,0 +1,7 @@
+# HTAN breast, 22 Visium sections
+cohort: htan_breast
+K: 6
+data_root: ${VIVATME_DATA}        # folder holding the frozen DiSCoTME inputs (see README)
+U: htan_breast/U.npy                        # n_spots x 512, [L2(image), L2(gene)]
+spots: htan_breast/spots.csv                # global_index, spot_id, sample_id, sample_index, x_um, y_um (+ annotations)
+out: ${VIVATME_OUT}

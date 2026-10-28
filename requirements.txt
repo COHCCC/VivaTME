@@ -1,0 +1,8 @@
+# Versions used for the published results (Python 3.9.18, CPU)
+numpy==2.0.2
+scipy==1.13.1
+pandas==2.3.3
+scikit-learn==1.6.1
+torch==2.4.1
+threadpoolctl==3.6.0
+PyYAML==6.0.3
